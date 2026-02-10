@@ -642,37 +642,68 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return
         }
 
-        // Write directly to config file instead of using CLI (more reliable from GUI)
+        // Use jq to modify config file (preserves formatting and is more reliable)
         let configPath = NSString(string: "~/.openclaw/openclaw.json").expandingTildeInPath
+        let tempPath = "/tmp/openclaw-config-temp.json"
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/jq")
+        task.arguments = [
+            "--arg", "model", modelId,
+            ".agents.defaults.model.primary = $model",
+            configPath
+        ]
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        task.standardOutput = outputPipe
+        task.standardError = errorPipe
 
         do {
-            let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
-            guard var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                debugLog("Failed to parse config as JSON")
-                sendErrorNotification("Failed to parse config")
-                return
+            try task.run()
+            task.waitUntilExit()
+
+            if task.terminationStatus == 0 {
+                // jq succeeded, write output to temp file then move to config
+                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+
+                // Write to temp file first
+                try outputData.write(to: URL(fileURLWithPath: tempPath))
+
+                // Move temp to config (atomic operation)
+                let moveTask = Process()
+                moveTask.executableURL = URL(fileURLWithPath: "/bin/mv")
+                moveTask.arguments = [tempPath, configPath]
+                try moveTask.run()
+                moveTask.waitUntilExit()
+
+                if moveTask.terminationStatus == 0 {
+                    debugLog("Model set to: \(modelId)")
+                    sendNotification(message: "Model changed to \(modelId)")
+                } else {
+                    debugLog("Failed to move config file")
+                    sendErrorNotification("Failed to save config")
+                }
+            } else {
+                let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                let errorOutput = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+                debugLog("jq failed: \(errorOutput)")
+                sendErrorNotification("Failed to update config")
             }
-
-            // Navigate to agents.defaults.model.primary and set it
-            var agents = json["agents"] as? [String: Any] ?? [:]
-            var defaults = agents["defaults"] as? [String: Any] ?? [:]
-            var model = defaults["model"] as? [String: Any] ?? [:]
-
-            model["primary"] = modelId
-            defaults["model"] = model
-            agents["defaults"] = defaults
-            json["agents"] = agents
-
-            // Write back to file
-            let updatedData = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-            try updatedData.write(to: URL(fileURLWithPath: configPath))
-
-            debugLog("Model set to: \(modelId)")
-
         } catch {
             debugLog("Error setting model: \(error.localizedDescription)")
             sendErrorNotification("Failed to set model: \(error.localizedDescription)")
         }
+    }
+
+    func sendNotification(message: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "OpenClaw"
+        content.body = message
+        content.sound = .default
+
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
     // MARK: - Configuration Reading
