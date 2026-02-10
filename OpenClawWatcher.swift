@@ -11,6 +11,17 @@ func debugLog(_ message: String) {
 func debugLog(_ message: String) {}
 #endif
 
+// MARK: - Model Info Structure
+struct ModelInfo {
+    let id: String
+    let name: String
+    let provider: String
+
+    var fullId: String {
+        return "\(provider)/\(id)"
+    }
+}
+
 @main
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     static func main() {
@@ -23,6 +34,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     var timer: Timer?
     var lastStatus: Bool = false
     var isFirstCheck = true
+
+    // Custom LM Studio base URL
+    let lmStudioBaseUrl = "192.168.50.10:1234"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Request notification permissions
@@ -93,6 +107,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
         menu.addItem(NSMenuItem.separator())
 
+        // Model selection submenu
+        let modelSubmenu = NSMenu()
+        let modelItem = NSMenuItem(title: "Model: Loading...", action: nil, keyEquivalent: "")
+        modelItem.tag = 300
+        modelItem.submenu = modelSubmenu
+        menu.addItem(modelItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchItem.target = self
         launchItem.tag = 200
@@ -103,6 +126,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         self.statusItem.menu = menu
+
+        // Populate model menu after setup
+        updateModelMenu()
     }
 
     func updateStatusIcon(running: Bool) {
@@ -116,7 +142,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             // Update status menu item
             if let menu = self.statusItem.menu,
                let item = menu.item(withTag: 100) {
-                item.title = running ? "Status: Running ✅" : "Status: Stopped ❌"
+                item.title = running ? "Status: Running" : "Status: Stopped"
             }
         }
     }
@@ -162,7 +188,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     func sendNotification(running: Bool) {
         let content = UNMutableNotificationContent()
         content.title = "OpenClaw"
-        content.body = running ? "Gateway is now running 🦞" : "Gateway has stopped 💀"
+        content.body = running ? "Gateway is now running" : "Gateway has stopped"
         content.sound = .default
 
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
@@ -298,9 +324,265 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
+    // MARK: - Model Selection
+
+    func getAvailableModels() -> [ModelInfo] {
+        var models: [ModelInfo] = []
+
+        guard let config = readOpenClawConfig() else {
+            debugLog("Could not read config for models")
+            return models
+        }
+
+        guard let modelsSection = config["models"] as? [String: Any],
+              let providers = modelsSection["providers"] as? [String: Any] else {
+            debugLog("Could not find models.providers in config")
+            return models
+        }
+
+        for (providerName, providerData) in providers {
+            guard let providerDict = providerData as? [String: Any],
+                  let providerModels = providerDict["models"] as? [[String: Any]] else {
+                continue
+            }
+
+            for modelData in providerModels {
+                guard let id = modelData["id"] as? String,
+                      let name = modelData["name"] as? String else {
+                    continue
+                }
+
+                let modelInfo = ModelInfo(id: id, name: name, provider: providerName)
+                models.append(modelInfo)
+            }
+        }
+
+        return models
+    }
+
+    func getCurrentModel() -> String? {
+        guard let config = readOpenClawConfig() else {
+            return nil
+        }
+
+        guard let agents = config["agents"] as? [String: Any],
+              let defaults = agents["defaults"] as? [String: Any],
+              let model = defaults["model"] as? [String: Any],
+              let primary = model["primary"] as? String else {
+            return nil
+        }
+
+        return primary
+    }
+
+    func updateModelMenu() {
+        guard let menu = statusItem.menu,
+              let modelMenuItem = menu.item(withTag: 300),
+              let modelSubmenu = modelMenuItem.submenu else {
+            debugLog("Could not find model submenu")
+            return
+        }
+
+        // Clear existing items
+        modelSubmenu.removeAllItems()
+
+        // Get current model and available models
+        let currentModel = getCurrentModel()
+        let availableModels = getAvailableModels()
+
+        // Update parent menu title
+        if let currentModel = currentModel {
+            // Extract display name from current model
+            let displayName = getModelDisplayName(fullId: currentModel, availableModels: availableModels)
+            modelMenuItem.title = "Model: \(displayName)"
+        } else {
+            modelMenuItem.title = "Model: Unknown"
+        }
+
+        // Group models by provider
+        var modelsByProvider: [String: [ModelInfo]] = [:]
+        for model in availableModels {
+            if modelsByProvider[model.provider] == nil {
+                modelsByProvider[model.provider] = []
+            }
+            modelsByProvider[model.provider]?.append(model)
+        }
+
+        // Sort providers for consistent ordering
+        let sortedProviders = modelsByProvider.keys.sorted { a, b in
+            // Put anthropic first, then gemini, then others alphabetically
+            let order = ["anthropic": 0, "gemini": 1, "openrouter": 2, "lmstudio": 3, "koboldcpp": 4]
+            let orderA = order[a] ?? 5
+            let orderB = order[b] ?? 5
+            if orderA != orderB {
+                return orderA < orderB
+            }
+            return a < b
+        }
+
+        // Add models grouped by provider
+        var isFirst = true
+        for provider in sortedProviders {
+            guard let models = modelsByProvider[provider] else { continue }
+
+            if !isFirst {
+                modelSubmenu.addItem(NSMenuItem.separator())
+            }
+            isFirst = false
+
+            // Provider header
+            let headerItem = NSMenuItem(title: provider.capitalized, action: nil, keyEquivalent: "")
+            headerItem.isEnabled = false
+            modelSubmenu.addItem(headerItem)
+
+            // Add models for this provider
+            for model in models {
+                let item = NSMenuItem(title: "  \(model.name)", action: #selector(selectModel(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = model.fullId
+
+                // Check if this is the current model
+                if let currentModel = currentModel, currentModel == model.fullId {
+                    item.state = .on
+                }
+
+                modelSubmenu.addItem(item)
+            }
+        }
+
+        // Add separator before custom option
+        if !availableModels.isEmpty {
+            modelSubmenu.addItem(NSMenuItem.separator())
+        }
+
+        // Add custom LM Studio option
+        let customHeader = NSMenuItem(title: "Custom", action: nil, keyEquivalent: "")
+        customHeader.isEnabled = false
+        modelSubmenu.addItem(customHeader)
+
+        let customItem = NSMenuItem(title: "  LM Studio (\(lmStudioBaseUrl))", action: #selector(selectCustomModel(_:)), keyEquivalent: "")
+        customItem.target = self
+        customItem.representedObject = "lmstudio:custom"
+
+        // Check if current model is custom
+        if let currentModel = currentModel, currentModel == "lmstudio:custom" {
+            customItem.state = .on
+        }
+
+        modelSubmenu.addItem(customItem)
+
+        // Add refresh option
+        modelSubmenu.addItem(NSMenuItem.separator())
+        let refreshItem = NSMenuItem(title: "Refresh Models", action: #selector(refreshModels), keyEquivalent: "")
+        refreshItem.target = self
+        modelSubmenu.addItem(refreshItem)
+    }
+
+    func getModelDisplayName(fullId: String, availableModels: [ModelInfo]) -> String {
+        // Check if it's a custom model
+        if fullId == "lmstudio:custom" {
+            return "LM Studio (Custom)"
+        }
+
+        // Find in available models
+        if let model = availableModels.first(where: { $0.fullId == fullId }) {
+            return model.name
+        }
+
+        // Fallback: extract from fullId
+        if fullId.contains("/") {
+            let parts = fullId.split(separator: "/", maxSplits: 1)
+            if parts.count == 2 {
+                return String(parts[1])
+            }
+        }
+
+        return fullId
+    }
+
+    @objc func selectModel(_ sender: NSMenuItem) {
+        guard let modelId = sender.representedObject as? String else {
+            debugLog("No model ID in menu item")
+            return
+        }
+
+        setActiveModel(modelId)
+        updateModelMenu()
+
+        // Ask user if they want to restart the gateway
+        promptGatewayRestart(modelName: sender.title.trimmingCharacters(in: .whitespaces))
+    }
+
+    @objc func selectCustomModel(_ sender: NSMenuItem) {
+        // For custom LM Studio, we could prompt for model name
+        // For now, just set a default custom identifier
+        setActiveModel("lmstudio:custom")
+        updateModelMenu()
+
+        promptGatewayRestart(modelName: "LM Studio (Custom)")
+    }
+
+    @objc func refreshModels() {
+        updateModelMenu()
+        debugLog("Model menu refreshed")
+    }
+
+    func promptGatewayRestart(modelName: String) {
+        DispatchQueue.main.async { [weak self] in
+            let alert = NSAlert()
+            alert.messageText = "Model Changed"
+            alert.informativeText = "Model set to \(modelName).\n\nRestart the gateway to apply the change?"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Restart Gateway")
+            alert.addButton(withTitle: "Later")
+
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                self?.restartGateway()
+            }
+        }
+    }
+
+    func setActiveModel(_ modelId: String) {
+        // Validate model ID format (basic security check)
+        let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_/:./"))
+        guard modelId.unicodeScalars.allSatisfy({ allowedCharacters.contains($0) }),
+              modelId.count <= 256 else {
+            debugLog("Invalid model ID format")
+            sendErrorNotification("Invalid model ID")
+            return
+        }
+
+        // Use openclaw CLI to set the model
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        task.arguments = ["-c", "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH && /opt/homebrew/bin/openclaw config set agents.defaults.model.primary '\(modelId)'"]
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+
+            if task.terminationStatus == 0 {
+                debugLog("Model set to: \(modelId)")
+            } else {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? "Unknown error"
+                debugLog("Failed to set model: \(output)")
+                sendErrorNotification("Failed to set model")
+            }
+        } catch {
+            debugLog("Error setting model: \(error.localizedDescription)")
+            sendErrorNotification("Error setting model")
+        }
+    }
+
     // MARK: - Configuration Reading
 
-    func getGatewayToken() -> String? {
+    func readOpenClawConfig() -> [String: Any]? {
         let configPath = NSString(string: "~/.openclaw/openclaw.json").expandingTildeInPath
         let fileManager = FileManager.default
 
@@ -319,39 +601,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return nil
         }
 
-        // Check file permissions (warn if world-readable)
-        do {
-            let attributes = try fileManager.attributesOfItem(atPath: configPath)
-            if let permissions = attributes[.posixPermissions] as? Int {
-                let otherPerms = permissions & 0o077
-                if otherPerms != 0 {
-                    debugLog("Warning: Config file has loose permissions: \(String(permissions, radix: 8))")
-                }
-            }
-        } catch {
-            debugLog("Could not check file permissions: \(error.localizedDescription)")
-        }
-
-        // Read and parse config
         do {
             let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let gateway = json["gateway"] as? [String: Any],
-               let auth = gateway["auth"] as? [String: Any],
-               let token = auth["token"] as? String {
-
-                // Basic token validation
-                guard token.count >= 10, token.count <= 1024 else {
-                    debugLog("Token has invalid length")
-                    return nil
-                }
-
-                return token
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return json
             }
         } catch {
             debugLog("Error reading config: \(error.localizedDescription)")
         }
+
         return nil
+    }
+
+    func getGatewayToken() -> String? {
+        guard let config = readOpenClawConfig() else {
+            return nil
+        }
+
+        guard let gateway = config["gateway"] as? [String: Any],
+              let auth = gateway["auth"] as? [String: Any],
+              let token = auth["token"] as? String else {
+            debugLog("Could not find gateway token in config")
+            return nil
+        }
+
+        // Basic token validation
+        guard token.count >= 10, token.count <= 1024 else {
+            debugLog("Token has invalid length")
+            return nil
+        }
+
+        return token
     }
 
     func sendErrorNotification(_ message: String) {
@@ -372,4 +652,3 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         completionHandler([.banner, .sound])
     }
 }
-
