@@ -522,11 +522,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return
         }
 
-        setActiveModel(modelId)
-        updateModelMenu()
-
-        // Ask user if they want to restart the gateway
-        promptGatewayRestart(modelName: sender.title.trimmingCharacters(in: .whitespaces))
+        let modelName = sender.title.trimmingCharacters(in: .whitespaces)
+        setActiveModel(modelId) { [weak self] success in
+            if success {
+                self?.updateModelMenu()
+                self?.promptGatewayRestart(modelName: modelName)
+            }
+        }
     }
 
     @objc func selectCustomModel(_ sender: NSMenuItem) {
@@ -587,10 +589,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
                 // Set the model as lmstudio/modelname@address
                 let fullModelId = "lmstudio/\(modelName)@\(address)"
-                self.setActiveModel(fullModelId)
-                self.updateModelMenu()
-
-                self.promptGatewayRestart(modelName: "\(modelName) @ \(address)")
+                self.setActiveModel(fullModelId) { success in
+                    if success {
+                        self.updateModelMenu()
+                        self.promptGatewayRestart(modelName: "\(modelName) @ \(address)")
+                    }
+                }
             }
         }
     }
@@ -632,31 +636,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    func setActiveModel(_ modelId: String) {
+    func setActiveModel(_ modelId: String, completion: @escaping (Bool) -> Void) {
         // Validate model ID format (basic security check)
         let allowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_/:./"))
         guard modelId.unicodeScalars.allSatisfy({ allowedCharacters.contains($0) }),
               modelId.count <= 256 else {
             debugLog("Invalid model ID format")
             sendErrorNotification("Invalid model ID")
+            completion(false)
             return
         }
 
-        // Use jq to modify config file (preserves formatting and is more reliable)
-        let configPath = NSString(string: "~/.openclaw/openclaw.json").expandingTildeInPath
+        // Use shell with jq to modify config (most reliable from GUI app)
+        let configPath = "~/.openclaw/openclaw.json"
         let tempPath = "/tmp/openclaw-config-temp.json"
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/opt/homebrew/bin/jq")
-        task.arguments = [
-            "--arg", "model", modelId,
-            ".agents.defaults.model.primary = $model",
-            configPath
-        ]
+        // Escape the model ID for shell
+        let escapedModelId = modelId.replacingOccurrences(of: "'", with: "'\\''")
 
-        let outputPipe = Pipe()
+        let command = "/usr/bin/jq --arg model '\(escapedModelId)' '.agents.defaults.model.primary = $model' \(configPath) > \(tempPath) && mv \(tempPath) \(configPath)"
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        task.arguments = ["-c", command]
+
         let errorPipe = Pipe()
-        task.standardOutput = outputPipe
         task.standardError = errorPipe
 
         do {
@@ -664,35 +668,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             task.waitUntilExit()
 
             if task.terminationStatus == 0 {
-                // jq succeeded, write output to temp file then move to config
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-
-                // Write to temp file first
-                try outputData.write(to: URL(fileURLWithPath: tempPath))
-
-                // Move temp to config (atomic operation)
-                let moveTask = Process()
-                moveTask.executableURL = URL(fileURLWithPath: "/bin/mv")
-                moveTask.arguments = [tempPath, configPath]
-                try moveTask.run()
-                moveTask.waitUntilExit()
-
-                if moveTask.terminationStatus == 0 {
-                    debugLog("Model set to: \(modelId)")
-                    sendNotification(message: "Model changed to \(modelId)")
-                } else {
-                    debugLog("Failed to move config file")
-                    sendErrorNotification("Failed to save config")
-                }
+                debugLog("Model set to: \(modelId)")
+                completion(true)
             } else {
                 let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
                 let errorOutput = String(data: errorData, encoding: .utf8) ?? "Unknown error"
-                debugLog("jq failed: \(errorOutput)")
-                sendErrorNotification("Failed to update config")
+                debugLog("Failed to set model: \(errorOutput)")
+                sendErrorNotification("Failed to save config")
+                completion(false)
             }
         } catch {
             debugLog("Error setting model: \(error.localizedDescription)")
-            sendErrorNotification("Failed to set model: \(error.localizedDescription)")
+            sendErrorNotification("Error: \(error.localizedDescription)")
+            completion(false)
         }
     }
 
