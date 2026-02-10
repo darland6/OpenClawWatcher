@@ -196,12 +196,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     @objc func startGateway() {
-        // Using shell here is necessary for nohup and background execution
-        // All arguments are hardcoded - no user input
-        // PATH must be set explicitly since GUI apps don't inherit shell PATH
+        // Source ~/.zshrc to get env vars (API keys), then start gateway
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        task.arguments = ["-c", "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH && nohup /opt/homebrew/bin/openclaw gateway > /tmp/openclaw-gateway.log 2>&1 &"]
+        task.arguments = ["-c", "source ~/.zshrc && nohup /opt/homebrew/bin/openclaw gateway > /tmp/openclaw-gateway.log 2>&1 &"]
 
         do {
             try task.run()
