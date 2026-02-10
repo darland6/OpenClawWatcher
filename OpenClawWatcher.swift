@@ -460,12 +460,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         customHeader.isEnabled = false
         modelSubmenu.addItem(customHeader)
 
-        let customItem = NSMenuItem(title: "  LM Studio (\(lmStudioBaseUrl))", action: #selector(selectCustomModel(_:)), keyEquivalent: "")
+        // Show last used model name if available
+        let lastModelName = getLastCustomModelName()
+        let customTitle = lastModelName != nil
+            ? "  LM Studio: \(lastModelName!) (\(lmStudioBaseUrl))"
+            : "  LM Studio (\(lmStudioBaseUrl))..."
+        let customItem = NSMenuItem(title: customTitle, action: #selector(selectCustomModel(_:)), keyEquivalent: "")
         customItem.target = self
-        customItem.representedObject = "lmstudio:custom"
+        customItem.representedObject = "lmstudio/\(lastModelName ?? "custom")"
 
-        // Check if current model is custom
-        if let currentModel = currentModel, currentModel == "lmstudio:custom" {
+        // Check if current model is a custom LM Studio model
+        if let currentModel = currentModel, currentModel.hasPrefix("lmstudio/") || currentModel == "lmstudio:custom" {
             customItem.state = .on
         }
 
@@ -479,7 +484,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func getModelDisplayName(fullId: String, availableModels: [ModelInfo]) -> String {
-        // Check if it's a custom model
+        // Check if it's a custom LM Studio model
+        if fullId.hasPrefix("lmstudio/") {
+            let modelName = String(fullId.dropFirst("lmstudio/".count))
+            return "LM Studio: \(modelName)"
+        }
         if fullId == "lmstudio:custom" {
             return "LM Studio (Custom)"
         }
@@ -514,12 +523,53 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     @objc func selectCustomModel(_ sender: NSMenuItem) {
-        // For custom LM Studio, we could prompt for model name
-        // For now, just set a default custom identifier
-        setActiveModel("lmstudio:custom")
-        updateModelMenu()
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
 
-        promptGatewayRestart(modelName: "LM Studio (Custom)")
+            // Create alert with text input for model name
+            let alert = NSAlert()
+            alert.messageText = "Custom LM Studio Model"
+            alert.informativeText = "Enter the model name for \(self.lmStudioBaseUrl):\n\n(e.g., llama-3.2-8b, qwen2.5-coder, mistral-7b)"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Set Model")
+            alert.addButton(withTitle: "Cancel")
+
+            // Create text field for model name input
+            let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+            textField.placeholderString = "model-name"
+            textField.stringValue = self.getLastCustomModelName() ?? ""
+            alert.accessoryView = textField
+
+            // Make text field first responder
+            alert.window.initialFirstResponder = textField
+
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                let modelName = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !modelName.isEmpty else {
+                    self.sendErrorNotification("Model name cannot be empty")
+                    return
+                }
+
+                // Save the custom model name for next time
+                self.saveLastCustomModelName(modelName)
+
+                // Set the model as lmstudio/modelname
+                let fullModelId = "lmstudio/\(modelName)"
+                self.setActiveModel(fullModelId)
+                self.updateModelMenu()
+
+                self.promptGatewayRestart(modelName: "LM Studio: \(modelName)")
+            }
+        }
+    }
+
+    func getLastCustomModelName() -> String? {
+        return UserDefaults.standard.string(forKey: "lastCustomModelName")
+    }
+
+    func saveLastCustomModelName(_ name: String) {
+        UserDefaults.standard.set(name, forKey: "lastCustomModelName")
     }
 
     @objc func refreshModels() {
